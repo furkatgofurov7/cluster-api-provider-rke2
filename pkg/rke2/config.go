@@ -18,9 +18,12 @@ package rke2
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -30,6 +33,8 @@ import (
 	controlplanev1 "github.com/rancher-sandbox/cluster-api-provider-rke2/controlplane/api/v1beta1"
 	"github.com/rancher-sandbox/cluster-api-provider-rke2/pkg/consts"
 	bsutil "github.com/rancher-sandbox/cluster-api-provider-rke2/pkg/util"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 const (
@@ -147,14 +152,17 @@ type rke2ServerConfig struct {
 
 // ServerConfigOpts is a struct that contains the information needed to generate a RKE2 server config.
 type ServerConfigOpts struct {
-	Cluster              clusterv1.Cluster
-	ControlPlaneEndpoint string
-	Token                string
-	ServerURL            string
-	ServerConfig         controlplanev1.RKE2ServerConfig
-	AgentConfig          bootstrapv1.RKE2AgentConfig
-	Ctx                  context.Context
-	Client               client.Client
+	Cluster               clusterv1.Cluster
+	Machine               clusterv1.Machine
+	ControlPlaneEndpoint  string
+	Token                 string
+	ServerURL             string
+	ServerConfig          controlplanev1.RKE2ServerConfig
+	AgentConfig           bootstrapv1.RKE2AgentConfig
+	Ctx                   context.Context
+	Client                client.Client
+	ServiceAccountToken   []byte
+	MachinePlanSecretName string
 }
 
 func newRKE2ServerConfig(opts ServerConfigOpts) (*rke2ServerConfig, []bootstrapv1.File, error) { // nolint:gocyclo
@@ -355,6 +363,96 @@ func newRKE2ServerConfig(opts ServerConfigOpts) (*rke2ServerConfig, []bootstrapv
 		rke2ServerConfig.CloudControllerManagerExtraMounts = opts.ServerConfig.CloudControllerManager.ExtraMounts
 		rke2ServerConfig.CloudControllerManagerExtraEnv = opts.ServerConfig.CloudControllerManager.ExtraEnv
 	}
+
+	// POC: Add system-node agent install script, config and connection info as files
+	serverUrlSetting := &unstructured.Unstructured{}
+	serverUrlSetting.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "management.cattle.io",
+		Kind:    "Setting",
+		Version: "v3",
+	})
+	if err := opts.Client.Get(context.Background(), client.ObjectKey{
+		Name: "server-url",
+	}, serverUrlSetting); err != nil {
+		return nil, nil, fmt.Errorf("failed to get server url setting: %w", err)
+	}
+	serverUrl, ok := serverUrlSetting.Object["value"].(string)
+	if !ok {
+		return nil, nil, fmt.Errorf("server url setting is missing value")
+	}
+
+	caSetting := &unstructured.Unstructured{}
+	caSetting.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "management.cattle.io",
+		Kind:    "Setting",
+		Version: "v3",
+	})
+	if err := opts.Client.Get(context.Background(), client.ObjectKey{
+		Name: "cacerts",
+	}, caSetting); err != nil {
+		return nil, nil, fmt.Errorf("failed to get ca setting: %w", err)
+	}
+
+	pem, ok := caSetting.Object["value"].(string)
+	if !ok {
+		return nil, nil, fmt.Errorf("ca setting is missing value")
+	}
+
+	kubeConfig, err := clientcmd.Write(clientcmdapi.Config{
+		Clusters: map[string]*clientcmdapi.Cluster{
+			"agent": {
+				Server:                   serverUrl,
+				CertificateAuthorityData: []byte(pem),
+			},
+		},
+		AuthInfos: map[string]*clientcmdapi.AuthInfo{
+			"agent": {
+				Token: string(opts.ServiceAccountToken),
+			},
+		},
+		Contexts: map[string]*clientcmdapi.Context{
+			"agent": {
+				Cluster:  "agent",
+				AuthInfo: "agent",
+			},
+		},
+		CurrentContext: "agent",
+	})
+
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to generate kubeconfig: %w", err)
+	}
+
+	connectInfoConfig := struct {
+		Namespace  string `json:"namespace"`
+		SecretName string `json:"secretName"`
+		KubeConfig string `json:"kubeConfig"`
+	}{
+		Namespace:  opts.Machine.Namespace,
+		SecretName: opts.MachinePlanSecretName,
+		KubeConfig: string(kubeConfig),
+	}
+
+	connectInfoConfigJson, err := json.MarshalIndent(connectInfoConfig, "", " ")
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal connect info config: %w", err)
+	}
+
+	files = append(files, bootstrapv1.File{
+		Path:        "/etc/rancher/agent/connect-info-config.json",
+		Permissions: "0600",
+		Content:     string(connectInfoConfigJson),
+	})
+
+	files = append(files, bootstrapv1.File{
+		Path:        "/etc/rancher/agent/config.yaml",
+		Permissions: "0600",
+		Content: `workDirectory: /var/lib/rancher/agent/work
+localPlanDirectory: /var/lib/rancher/agent/plans
+remoteEnabled: true
+connectionInfoFile: /etc/rancher/agent/connect-info-config.json
+preserveWorkDirectory: true`,
+	})
 
 	return rke2ServerConfig, files, nil
 }

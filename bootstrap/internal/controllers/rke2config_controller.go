@@ -90,6 +90,7 @@ const (
 //+kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;clusters/status;machinesets;machines;machines/status;machinepools;machinepools/status,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=secrets;events;configmaps;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="management.cattle.io",resources=*,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -178,21 +179,21 @@ func (r *RKE2ConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	// POC: Create a ServiceAccount with Secret, Role, and RoleBinding for the system-agent to use later.
-	planSecretName := strings.Join([]string{scope.Machine.Name, "machine", "plan"}, "-")
-
-	if err := r.createSecretPlanResources(ctx, planSecretName, scope.Cluster, scope.Machine); err != nil {
+	if err := r.createSecretPlanResources(ctx, scope.MachinePlanSecretName, scope.Cluster, scope.Machine); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	secretPopulated, err := r.ensureServiceAccountSecretPopulated(ctx, planSecretName)
+	serviceAccountToken, err := r.ensureServiceAccountSecretPopulated(ctx, scope.MachinePlanSecretName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if !secretPopulated {
-		logger.Info(fmt.Sprintf("Secret %s not yet populated", planSecretName))
+	if len(serviceAccountToken) == 0 {
+		logger.Info(fmt.Sprintf("Secret %s not yet populated", scope.MachinePlanSecretName))
 		return ctrl.Result{RequeueAfter: DefaultRequeueAfter}, nil
 	}
+
+	scope.ServiceAccountToken = serviceAccountToken
 
 	// Note: can't use IsFalse here because we need to handle the absence of the condition as well as false.
 	if !conditions.IsTrue(scope.Cluster, clusterv1.ControlPlaneInitializedCondition) {
@@ -297,17 +298,21 @@ func (r *RKE2ConfigReconciler) prepareScope(
 
 	scope.Cluster = cluster
 
+	scope.MachinePlanSecretName = strings.Join([]string{scope.Machine.Name, "machine", "plan"}, "-")
+
 	return scope, ctrl.Result{}, nil
 }
 
 // Scope is a scoped struct used during reconciliation.
 type Scope struct {
-	Logger               logr.Logger
-	Config               *bootstrapv1.RKE2Config
-	Machine              *clusterv1.Machine
-	Cluster              *clusterv1.Cluster
-	HasControlPlaneOwner bool
-	ControlPlane         *controlplanev1.RKE2ControlPlane
+	Logger                logr.Logger
+	Config                *bootstrapv1.RKE2Config
+	Machine               *clusterv1.Machine
+	Cluster               *clusterv1.Cluster
+	HasControlPlaneOwner  bool
+	ControlPlane          *controlplanev1.RKE2ControlPlane
+	ServiceAccountToken   []byte
+	MachinePlanSecretName string
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -387,14 +392,17 @@ func (r *RKE2ConfigReconciler) handleClusterNotInitialized(ctx context.Context, 
 
 	configStruct, configFiles, err := rke2.GenerateInitControlPlaneConfig(
 		rke2.ServerConfigOpts{
-			Cluster:              *scope.Cluster,
-			ControlPlaneEndpoint: scope.Cluster.Spec.ControlPlaneEndpoint.Host,
-			Token:                token,
-			ServerURL:            fmt.Sprintf(serverURLFormat, scope.Cluster.Spec.ControlPlaneEndpoint.Host, registrationPort),
-			ServerConfig:         scope.ControlPlane.Spec.ServerConfig,
-			AgentConfig:          scope.Config.Spec.AgentConfig,
-			Ctx:                  ctx,
-			Client:               r.Client,
+			Cluster:               *scope.Cluster,
+			Machine:               *scope.Machine,
+			ControlPlaneEndpoint:  scope.Cluster.Spec.ControlPlaneEndpoint.Host,
+			Token:                 token,
+			ServerURL:             fmt.Sprintf(serverURLFormat, scope.Cluster.Spec.ControlPlaneEndpoint.Host, registrationPort),
+			ServerConfig:          scope.ControlPlane.Spec.ServerConfig,
+			AgentConfig:           scope.Config.Spec.AgentConfig,
+			Ctx:                   ctx,
+			Client:                r.Client,
+			ServiceAccountToken:   scope.ServiceAccountToken,
+			MachinePlanSecretName: scope.MachinePlanSecretName,
 		})
 	if err != nil {
 		return ctrl.Result{}, err
@@ -563,14 +571,17 @@ func (r *RKE2ConfigReconciler) joinControlplane(ctx context.Context, scope *Scop
 
 	configStruct, configFiles, err := rke2.GenerateJoinControlPlaneConfig(
 		rke2.ServerConfigOpts{
-			Cluster:              *scope.Cluster,
-			Token:                token,
-			ControlPlaneEndpoint: scope.Cluster.Spec.ControlPlaneEndpoint.Host,
-			ServerURL:            fmt.Sprintf(serverURLFormat, scope.ControlPlane.Status.AvailableServerIPs[0], registrationPort),
-			ServerConfig:         scope.ControlPlane.Spec.ServerConfig,
-			AgentConfig:          scope.Config.Spec.AgentConfig,
-			Ctx:                  ctx,
-			Client:               r.Client,
+			Cluster:               *scope.Cluster,
+			Machine:               *scope.Machine,
+			Token:                 token,
+			ControlPlaneEndpoint:  scope.Cluster.Spec.ControlPlaneEndpoint.Host,
+			ServerURL:             fmt.Sprintf(serverURLFormat, scope.ControlPlane.Status.AvailableServerIPs[0], registrationPort),
+			ServerConfig:          scope.ControlPlane.Spec.ServerConfig,
+			AgentConfig:           scope.Config.Spec.AgentConfig,
+			Ctx:                   ctx,
+			Client:                r.Client,
+			ServiceAccountToken:   scope.ServiceAccountToken,
+			MachinePlanSecretName: scope.MachinePlanSecretName,
 		},
 	)
 	if err != nil {
@@ -1001,7 +1012,7 @@ func (r *RKE2ConfigReconciler) createSecretPlanResources(ctx context.Context, pl
 	return nil
 }
 
-func (r *RKE2ConfigReconciler) ensureServiceAccountSecretPopulated(ctx context.Context, planSecretName string) (bool, error) {
+func (r *RKE2ConfigReconciler) ensureServiceAccountSecretPopulated(ctx context.Context, planSecretName string) ([]byte, error) {
 	logger := log.FromContext(ctx)
 
 	logger.Info("Ensuring service account secret is populated")
@@ -1009,16 +1020,16 @@ func (r *RKE2ConfigReconciler) ensureServiceAccountSecretPopulated(ctx context.C
 	secretList := &corev1.SecretList{}
 
 	if err := r.List(ctx, secretList, client.MatchingLabels{ServiceAccountSecretLabel: planSecretName}); err != nil {
-		return false, fmt.Errorf("failed to list secrets: %w", err)
+		return nil, fmt.Errorf("failed to list secrets: %w", err)
 	}
 
 	if len(secretList.Items) == 0 || len(secretList.Items) > 1 {
-		return false, fmt.Errorf("secret for %s doesn't exist, or more than one secret exists", planSecretName)
+		return nil, fmt.Errorf("secret for %s doesn't exist, or more than one secret exists", planSecretName)
 	}
 
 	saSecret := secretList.Items[0]
 
-	return len(saSecret.Data[corev1.ServiceAccountTokenKey]) > 0, nil
+	return saSecret.Data[corev1.ServiceAccountTokenKey], nil
 }
 
 func generateFilesFromManifestConfig(
