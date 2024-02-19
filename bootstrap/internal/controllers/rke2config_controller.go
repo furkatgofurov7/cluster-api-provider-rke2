@@ -19,11 +19,13 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -67,6 +69,14 @@ type RKE2ConfigReconciler struct {
 }
 
 const (
+	ClusterNameLabel    = "cluster.x-k8s.io/cluster-name"
+	MachineNameLabel    = "cluster.x-k8s.io/machine-name"
+	PlanSecretNameLabel = "cluster-api.cattle.io/plan-secret-name"
+
+	ServiceAccountSecretLabel = "cluster-api.cattle.io/service-account.name"
+
+	SecretTypeMachinePlan = "cluster-api.cattle.io/machine-plan"
+
 	// DefaultManifestDirectory is the default directory to store kubernetes manifests that RKE2 will deploy automatically.
 	DefaultManifestDirectory string = "/var/lib/rancher/rke2/server/manifests"
 
@@ -78,7 +88,8 @@ const (
 //+kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=rke2configs;rke2configs/status;rke2configs/finalizers,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=rke2controlplanes;rke2controlplanes/status,verbs=get;list;watch
 //+kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;clusters/status;machinesets;machines;machines/status;machinepools;machinepools/status,verbs=get;list;watch
-//+kubebuilder:rbac:groups="",resources=secrets;events;configmaps,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="",resources=secrets;events;configmaps;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups="rbac.authorization.k8s.io",resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -164,6 +175,23 @@ func (r *RKE2ConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		conditions.MarkTrue(scope.Config, bootstrapv1.DataSecretAvailableCondition)
 
 		return ctrl.Result{}, nil
+	}
+
+	// POC: Create a ServiceAccount with Secret, Role, and RoleBinding for the system-agent to use later.
+	planSecretName := strings.Join([]string{scope.Machine.Name, "machine", "plan"}, "-")
+
+	if err := r.createSecretPlanResources(ctx, planSecretName, scope.Cluster, scope.Machine); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	secretPopulated, err := r.ensureServiceAccountSecretPopulated(ctx, planSecretName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if !secretPopulated {
+		logger.Info(fmt.Sprintf("Secret %s not yet populated", planSecretName))
+		return ctrl.Result{RequeueAfter: DefaultRequeueAfter}, nil
 	}
 
 	// Note: can't use IsFalse here because we need to handle the absence of the condition as well as false.
@@ -884,6 +912,113 @@ func (r *RKE2ConfigReconciler) createOrUpdateSecretFromObject(
 	}
 
 	return
+}
+
+func (r *RKE2ConfigReconciler) createSecretPlanResources(ctx context.Context, planSecretName string, cluster *clusterv1.Cluster, machine *clusterv1.Machine) error {
+	logger := log.FromContext(ctx)
+
+	logger.Info("Creating secret plan resources")
+
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      planSecretName,
+			Namespace: machine.Namespace,
+			Labels: map[string]string{
+				MachineNameLabel:    machine.Name,
+				PlanSecretNameLabel: planSecretName,
+			},
+		},
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      planSecretName,
+			Namespace: machine.Namespace,
+			Labels: map[string]string{
+				MachineNameLabel: machine.Name,
+				ClusterNameLabel: cluster.Name,
+			},
+		},
+		Type: SecretTypeMachinePlan,
+	}
+
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      planSecretName,
+			Namespace: machine.Namespace,
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				Verbs:         []string{"watch", "get", "update", "list"},
+				APIGroups:     []string{""},
+				Resources:     []string{"secrets"},
+				ResourceNames: []string{planSecretName},
+			},
+		},
+	}
+
+	roleBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      planSecretName,
+			Namespace: machine.Namespace,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      sa.Name,
+				Namespace: sa.Namespace,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "Role",
+			Name:     planSecretName,
+		},
+	}
+
+	saSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-token", planSecretName),
+			Namespace: machine.Namespace,
+			Annotations: map[string]string{
+				"kubernetes.io/service-account.name": planSecretName,
+			},
+			Labels: map[string]string{
+				ServiceAccountSecretLabel: planSecretName,
+			},
+		},
+		Type: corev1.SecretTypeServiceAccountToken,
+	}
+
+	for _, obj := range []client.Object{sa, secret, role, roleBinding, saSecret} {
+		if err := r.Create(ctx, obj); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return fmt.Errorf("failed to create %s: %w", obj.GetObjectKind().GroupVersionKind().String(), err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (r *RKE2ConfigReconciler) ensureServiceAccountSecretPopulated(ctx context.Context, planSecretName string) (bool, error) {
+	logger := log.FromContext(ctx)
+
+	logger.Info("Ensuring service account secret is populated")
+
+	secretList := &corev1.SecretList{}
+
+	if err := r.List(ctx, secretList, client.MatchingLabels{ServiceAccountSecretLabel: planSecretName}); err != nil {
+		return false, fmt.Errorf("failed to list secrets: %w", err)
+	}
+
+	if len(secretList.Items) == 0 || len(secretList.Items) > 1 {
+		return false, fmt.Errorf("secret for %s doesn't exist, or more than one secret exists", planSecretName)
+	}
+
+	saSecret := secretList.Items[0]
+
+	return len(saSecret.Data[corev1.ServiceAccountTokenKey]) > 0, nil
 }
 
 func generateFilesFromManifestConfig(
