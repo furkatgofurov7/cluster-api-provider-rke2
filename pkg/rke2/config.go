@@ -381,6 +381,10 @@ func newRKE2ServerConfig(opts ServerConfigOpts) (*rke2ServerConfig, []bootstrapv
 		return nil, nil, fmt.Errorf("server url setting is missing value")
 	}
 
+	if serverUrl == "" {
+		return nil, nil, fmt.Errorf("server url is empty")
+	}
+
 	caSetting := &unstructured.Unstructured{}
 	caSetting.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "management.cattle.io",
@@ -440,18 +444,29 @@ func newRKE2ServerConfig(opts ServerConfigOpts) (*rke2ServerConfig, []bootstrapv
 
 	files = append(files, bootstrapv1.File{
 		Path:        "/etc/rancher/agent/connect-info-config.json",
+		Owner:       consts.DefaultFileOwner,
 		Permissions: "0600",
 		Content:     string(connectInfoConfigJson),
 	})
 
 	files = append(files, bootstrapv1.File{
 		Path:        "/etc/rancher/agent/config.yaml",
+		Owner:       consts.DefaultFileOwner,
 		Permissions: "0600",
 		Content: `workDirectory: /var/lib/rancher/agent/work
 localPlanDirectory: /var/lib/rancher/agent/plans
 remoteEnabled: true
 connectionInfoFile: /etc/rancher/agent/connect-info-config.json
 preserveWorkDirectory: true`,
+	})
+
+	serverUrlBash := fmt.Sprintf("CATTLE_SERVER=%s\n", serverUrl)
+
+	files = append(files, bootstrapv1.File{
+		Path:        "/opt/system-agent-install.sh",
+		Owner:       consts.DefaultFileOwner,
+		Permissions: "0600",
+		Content:     fmt.Sprintf("%s%s", serverUrlBash, installsh),
 	})
 
 	return rke2ServerConfig, files, nil

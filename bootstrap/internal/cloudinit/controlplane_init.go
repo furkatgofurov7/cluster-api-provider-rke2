@@ -37,6 +37,7 @@ runcmd:
   - 'systemctl start rke2-server.service'
   - 'mkdir /run/cluster-api' 
   - '{{ .SentinelFileCommand }}'
+  - 'sudo sh /opt/system-agent-install.sh'
 {{- template "commands" .PostRKE2Commands }}
 {{ .AdditionalCloudInit -}}
 `
