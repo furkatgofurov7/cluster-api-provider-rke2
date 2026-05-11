@@ -3,7 +3,7 @@ name: release
 on:
   push:
     tags:
-    - "test-v*"
+    - "v*-test"
 
 env:
   TAG: ${{ github.ref_name }}
