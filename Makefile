@@ -527,7 +527,7 @@ push-rke2-bootstrap-image: docker-pull-prerequisites ## Build and push bootstrap
 		--build-arg builder_image=$(GO_CONTAINER_IMAGE) \
 		--build-arg goproxy=$(GOPROXY) \
 		--build-arg package=./bootstrap \
-		--build-arg ldflags="$(LDFLAGS)" . -t $(REPO)/$(DOCKER_IMAGE):$(TAG)
+		--build-arg ldflags="$(LDFLAGS)" . -t $(REPO)/$(BOOTSTRAP_IMAGE_NAME):$(TAG)
 	$(MAKE) set-manifest-pull-policy TARGET_RESOURCE="./bootstrap/config/default/manager_pull_policy.yaml"
 
 .PHONY: push-rke2-controlplane-image
@@ -542,7 +542,7 @@ push-rke2-controlplane-image: docker-pull-prerequisites ## Build and push contro
 		--build-arg builder_image=$(GO_CONTAINER_IMAGE) \
 		--build-arg goproxy=$(GOPROXY) \
 		--build-arg package=./controlplane \
-		--build-arg ldflags="$(LDFLAGS)" . -t $(REPO)/$(DOCKER_IMAGE):$(TAG)
+		--build-arg ldflags="$(LDFLAGS)" . -t $(REPO)/$(CONTROLPLANE_IMAGE_NAME):$(TAG)
 	$(MAKE) set-manifest-pull-policy TARGET_RESOURCE="./controlplane/config/default/manager_pull_policy.yaml"
 
 .PHONY: push-prime-rke2-bootstrap-image
