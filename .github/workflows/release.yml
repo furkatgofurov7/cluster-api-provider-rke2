@@ -8,6 +8,7 @@ on:
 env:
   TAG: ${{ github.ref_name }}
   GHCR_REGISTRY: ghcr.io
+  DOCKERHUB_REGISTRY: docker.io
 
 jobs:
   build:
@@ -25,34 +26,34 @@ jobs:
 
     - name: Set test credentials
       run: |
-        echo "PRIME_REGISTRY=docker.io" >> $GITHUB_ENV
-        echo "PRIME_REGISTRY_USERNAME=furkat007" >> $GITHUB_ENV
-        echo "PRIME_REGISTRY_PASSWORD=${{ secrets.DOCKER_PASSWORD }}" >> $GITHUB_ENV
+        echo "PRIME_REGISTRY=ghcr.io" >> $GITHUB_ENV
+        echo "PRIME_REGISTRY_USERNAME=furkatgofurov7" >> $GITHUB_ENV
+        echo "PRIME_REGISTRY_PASSWORD=${{ secrets.GITHUB_TOKEN }}" >> $GITHUB_ENV
 
-    - name: Push bootstrap image to ghcr.io
+    - name: Push bootstrap image to DockerHub
       uses: rancher/ecm-distro-tools/actions/publish-image@067de5ae5517b661b4d2f10e22cc5a21aa0ac915
       with:
         image: cluster-api-provider-rke2-bootstrap
         tag: ${{ env.TAG }}
         platforms: linux/amd64,linux/arm64
         push-to-prime: false
-        public-registry: ${{ env.GHCR_REGISTRY }}
-        public-repo: furkatgofurov7
-        public-username: ${{ github.actor }}
-        public-password: ${{ secrets.GITHUB_TOKEN }}
+        public-registry: ${{ env.DOCKERHUB_REGISTRY }}
+        public-repo: furkat007
+        public-username: furkat007
+        public-password: ${{ secrets.DOCKER_PASSWORD }}
         make-target: push-rke2-bootstrap-image
 
-    - name: Push controlplane image to ghcr.io
+    - name: Push controlplane image to DockerHub
       uses: rancher/ecm-distro-tools/actions/publish-image@067de5ae5517b661b4d2f10e22cc5a21aa0ac915
       with:
         image: cluster-api-provider-rke2-controlplane
         tag: ${{ env.TAG }}
         platforms: linux/amd64,linux/arm64
         push-to-prime: false
-        public-registry: ${{ env.GHCR_REGISTRY }}
-        public-repo: furkatgofurov7
-        public-username: ${{ github.actor }}
-        public-password: ${{ secrets.GITHUB_TOKEN }}
+        public-registry: ${{ env.DOCKERHUB_REGISTRY }}
+        public-repo: furkat007
+        public-username: furkat007
+        public-password: ${{ secrets.DOCKER_PASSWORD }}
         make-target: push-rke2-controlplane-image
 
     - name: Push bootstrap image to prime registry
@@ -62,7 +63,7 @@ jobs:
         tag: ${{ env.TAG }}
         platforms: linux/amd64,linux/arm64
         push-to-public: false
-        prime-repo: furkat007
+        prime-repo: furkatgofurov7
         prime-registry: ${{ env.PRIME_REGISTRY }}
         prime-username: ${{ env.PRIME_REGISTRY_USERNAME }}
         prime-password: ${{ env.PRIME_REGISTRY_PASSWORD }}
@@ -75,7 +76,7 @@ jobs:
         tag: ${{ env.TAG }}
         platforms: linux/amd64,linux/arm64
         push-to-public: false
-        prime-repo: furkat007
+        prime-repo: furkatgofurov7
         prime-registry: ${{ env.PRIME_REGISTRY }}
         prime-username: ${{ env.PRIME_REGISTRY_USERNAME }}
         prime-password: ${{ env.PRIME_REGISTRY_PASSWORD }}
