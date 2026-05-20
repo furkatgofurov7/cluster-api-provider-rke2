@@ -31,7 +31,7 @@ jobs:
         echo "PRIME_REGISTRY_PASSWORD=${{ secrets.GITHUB_TOKEN }}" >> $GITHUB_ENV
 
     - name: Push bootstrap image to DockerHub
-      uses: rancher/ecm-distro-tools/actions/publish-image@067de5ae5517b661b4d2f10e22cc5a21aa0ac915
+      uses: furkatgofurov7/ecm-distro-tools/actions/publish-image@7f8f89f54e345fcd9ed95b9e010ebcac4d10ddc9
       with:
         image: cluster-api-provider-rke2-bootstrap
         tag: ${{ env.TAG }}
@@ -44,7 +44,7 @@ jobs:
         make-target: push-rke2-bootstrap-image
 
     - name: Push controlplane image to DockerHub
-      uses: rancher/ecm-distro-tools/actions/publish-image@067de5ae5517b661b4d2f10e22cc5a21aa0ac915
+      uses: furkatgofurov7/ecm-distro-tools/actions/publish-image@7f8f89f54e345fcd9ed95b9e010ebcac4d10ddc9
       with:
         image: cluster-api-provider-rke2-controlplane
         tag: ${{ env.TAG }}
@@ -57,7 +57,7 @@ jobs:
         make-target: push-rke2-controlplane-image
 
     - name: Push bootstrap image to prime registry
-      uses: rancher/ecm-distro-tools/actions/publish-image@067de5ae5517b661b4d2f10e22cc5a21aa0ac915
+      uses: furkatgofurov7/ecm-distro-tools/actions/publish-image@7f8f89f54e345fcd9ed95b9e010ebcac4d10ddc9
       with:
         image: cluster-api-provider-rke2-bootstrap
         tag: ${{ env.TAG }}
@@ -70,7 +70,7 @@ jobs:
         prime-make-target: push-prime-rke2-bootstrap-image
 
     - name: Push controlplane image to prime registry
-      uses: rancher/ecm-distro-tools/actions/publish-image@067de5ae5517b661b4d2f10e22cc5a21aa0ac915
+      uses: furkatgofurov7/ecm-distro-tools/actions/publish-image@7f8f89f54e345fcd9ed95b9e010ebcac4d10ddc9
       with:
         image: cluster-api-provider-rke2-controlplane
         tag: ${{ env.TAG }}
