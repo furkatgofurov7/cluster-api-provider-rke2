@@ -110,7 +110,7 @@ jobs:
     - name: Package and publish release manifests as OCI artifacts
       env:
         ORAS_VERSION: 1.2.3
-        ARTIFACT_NAME: ${{ env.PRIME_REGISTRY }}/furkatgofurov7/cluster-api-provider-rke2-components
+        ARTIFACT_NAME: ${{ env.PRIME_REGISTRY }}/furkat007/cluster-api-provider-rke2-components
         REGISTRY_PASSWORD: ${{ env.PRIME_REGISTRY_PASSWORD }}
         REGISTRY_USERNAME: ${{ env.PRIME_REGISTRY_USERNAME }}
         REGISTRY_HOST: ${{ env.PRIME_REGISTRY }}
