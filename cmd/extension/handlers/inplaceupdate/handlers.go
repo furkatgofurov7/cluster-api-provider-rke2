@@ -23,10 +23,11 @@ limitations under the License.
 //
 // Field allowlist rationale:
 //   - In-place capable: changes that only require an RKE2/kubelet restart
-//     (Files, AdditionalUserData, NodeLabels, NodeTaints, NodeNamePrefix, Kubelet).
+//     (currently: Files only — see canUpdateRKE2ConfigSpec).
 //   - Replace-required: changes that require full node re-provisioning
 //     (PreRKE2Commands, PostRKE2Commands, PrivateRegistriesConfig, AirGapped,
-//     AirGappedChecksum, CISProfile).
+//     AirGappedChecksum, CISProfile, and — until buildUpgradePlan supports
+//     them — NodeLabels, NodeTaints, NodeNamePrefix, Kubelet).
 package inplaceupdate
 
 import (
@@ -37,6 +38,7 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"time"
 
 	"github.com/pkg/errors"
 	"gomodules.xyz/jsonpatch/v2"
@@ -61,6 +63,17 @@ const (
 	// secretTypeMachinePlan is the Secret.Type that Rancher's system-agent
 	// sets on the machine-plan Secret it registers on first contact.
 	secretTypeMachinePlan = "rke.cattle.io/machine-plan"
+
+	// inplaceUpdateStartedAnnotation records when this extension first
+	// observed the current in-place update attempt for a Machine. Used to
+	// bound how long DoUpdateMachine will keep retrying before giving up.
+	inplaceUpdateStartedAnnotation = "rke2.cattle.io/inplace-update-started-at"
+
+	// inplaceUpdateTimeout bounds total wait time across both "machine-plan
+	// Secret not yet registered" and "plan in progress" retry loops. Past
+	// this, DoUpdateMachine reports Failure so CAPRKE2 can fall back to a
+	// rolling replace instead of polling forever.
+	inplaceUpdateTimeout = 30 * time.Minute
 )
 
 // ExtensionHandlers holds the shared client used by all in-place update hook handlers.
@@ -95,34 +108,20 @@ func canUpdateMachineSpec(current, desired *clusterv1.MachineSpec) {
 
 // canUpdateRKE2ConfigSpec declares that this extension can update:
 //   - RKE2ConfigSpec.Files
-//   - RKE2ConfigSpec.AgentConfig.NodeLabels
-//   - RKE2ConfigSpec.AgentConfig.NodeTaints
-//   - RKE2ConfigSpec.AgentConfig.NodeNamePrefix
-//   - RKE2ConfigSpec.AgentConfig.Kubelet
-//   - RKE2ConfigSpec.AgentConfig.AdditionalUserData
+//
+// NodeLabels, NodeTaints, Kubelet, and NodeNamePrefix are NOT included here
+// even though they could theoretically change without a full re-provision,
+// because buildUpgradePlan does not yet translate any of them into plan
+// content. Declaring them here without implementing the corresponding
+// instructions would cause CAPRKE2 to mark a Machine up-to-date after an
+// update that silently did nothing for those fields. Add them back only
+// alongside the matching buildUpgradePlan support.
+// NodeNamePrefix is deliberately excluded permanently — renaming a running
+// node's identity isn't a meaningful in-place operation regardless of
+// buildUpgradePlan support.
 func canUpdateRKE2ConfigSpec(current, desired *bootstrapv1.RKE2ConfigSpec) {
 	if !reflect.DeepEqual(current.Files, desired.Files) {
 		current.Files = desired.Files
-	}
-
-	if !reflect.DeepEqual(current.AgentConfig.NodeLabels, desired.AgentConfig.NodeLabels) {
-		current.AgentConfig.NodeLabels = desired.AgentConfig.NodeLabels
-	}
-
-	if !reflect.DeepEqual(current.AgentConfig.NodeTaints, desired.AgentConfig.NodeTaints) {
-		current.AgentConfig.NodeTaints = desired.AgentConfig.NodeTaints
-	}
-
-	if current.AgentConfig.NodeNamePrefix != desired.AgentConfig.NodeNamePrefix {
-		current.AgentConfig.NodeNamePrefix = desired.AgentConfig.NodeNamePrefix
-	}
-
-	if !reflect.DeepEqual(current.AgentConfig.Kubelet, desired.AgentConfig.Kubelet) {
-		current.AgentConfig.Kubelet = desired.AgentConfig.Kubelet
-	}
-
-	if !reflect.DeepEqual(current.AgentConfig.AdditionalUserData, desired.AgentConfig.AdditionalUserData) {
-		current.AgentConfig.AdditionalUserData = desired.AgentConfig.AdditionalUserData
 	}
 }
 
@@ -249,6 +248,27 @@ func (h *ExtensionHandlers) DoUpdateMachine(
 		return
 	}
 
+	// Bound total wait time so a Machine can't get stuck retrying forever if
+	// the machine-plan Secret never appears or the plan never completes.
+	timedOut, err := h.checkTimeout(ctx, machine)
+	if err != nil {
+		resp.Status = runtimehooksv1.ResponseStatusFailure
+		resp.Message = fmt.Sprintf("failed to check in-place update timeout: %v", err)
+
+		return
+	}
+	if timedOut {
+		log.Info("in-place update timed out; reporting failure so CAPRKE2 can fall back to a rolling replace")
+		resp.Status = runtimehooksv1.ResponseStatusFailure
+		resp.Message = fmt.Sprintf("in-place update did not complete within %s", inplaceUpdateTimeout)
+
+		if err := h.clearTimeoutAnnotation(ctx, machine); err != nil {
+			log.Error(err, "failed to clear in-place update timeout annotation after timeout")
+		}
+
+		return
+	}
+
 	// Find the machine-plan Secret registered by system-agent on first contact.
 	secret, err := h.findMachinePlanSecret(ctx, machine)
 	if err != nil {
@@ -300,14 +320,60 @@ func (h *ExtensionHandlers) DoUpdateMachine(
 		log.Info("Machine upgrade complete")
 		resp.Status = runtimehooksv1.ResponseStatusSuccess
 		resp.RetryAfterSeconds = 0
+
+		if err := h.clearTimeoutAnnotation(ctx, machine); err != nil {
+			log.Error(err, "failed to clear in-place update timeout annotation after success")
+		}
 	case ps.Failure():
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = "node-side plan execution failed; inspect the machine-plan Secret for details"
+
+		if err := h.clearTimeoutAnnotation(ctx, machine); err != nil {
+			log.Error(err, "failed to clear in-place update timeout annotation after failure")
+		}
 	default:
 		log.V(1).Info("Machine upgrade in progress", "planStatus", ps.String())
 		resp.Status = runtimehooksv1.ResponseStatusSuccess
 		resp.RetryAfterSeconds = 30
 	}
+}
+
+// checkTimeout stamps machine with inplaceUpdateStartedAnnotation on first
+// call and returns true once inplaceUpdateTimeout has elapsed since. Callers
+// should treat true as "give up and report Failure".
+func (h *ExtensionHandlers) checkTimeout(ctx context.Context, machine *clusterv1.Machine) (bool, error) {
+	startedAt, ok := machine.Annotations[inplaceUpdateStartedAnnotation]
+	if !ok {
+		patch := client.MergeFrom(machine.DeepCopy())
+		if machine.Annotations == nil {
+			machine.Annotations = map[string]string{}
+		}
+		machine.Annotations[inplaceUpdateStartedAnnotation] = time.Now().UTC().Format(time.RFC3339)
+
+		return false, h.client.Patch(ctx, machine, patch)
+	}
+
+	started, err := time.Parse(time.RFC3339, startedAt)
+	if err != nil {
+		// Malformed annotation shouldn't block retries; treat as just-started.
+		return false, nil
+	}
+
+	return time.Since(started) > inplaceUpdateTimeout, nil
+}
+
+// clearTimeoutAnnotation removes the started-at marker once an update
+// reaches a terminal state (success or failure), so the next update attempt
+// starts its timeout window fresh.
+func (h *ExtensionHandlers) clearTimeoutAnnotation(ctx context.Context, machine *clusterv1.Machine) error {
+	if _, ok := machine.Annotations[inplaceUpdateStartedAnnotation]; !ok {
+		return nil
+	}
+
+	patch := client.MergeFrom(machine.DeepCopy())
+	delete(machine.Annotations, inplaceUpdateStartedAnnotation)
+
+	return h.client.Patch(ctx, machine, patch)
 }
 
 func (h *ExtensionHandlers) getObjectsFromCanUpdateMachineRequest(
@@ -329,21 +395,26 @@ func (h *ExtensionHandlers) getObjectsFromCanUpdateMachineRequest(
 	return currentMachine, desiredMachine, currentBootstrapConfig, desiredBootstrapConfig, nil
 }
 
-// findMachinePlanSecret lists Secrets in the machine's namespace filtered by the
-// four lifecycle labels that uniquely identify a machine-plan Secret, then
-// returns the one with the system-agent Secret type.
+// findMachinePlanSecret lists Secrets in the machine's namespace filtered by
+// the six lifecycle labels (Cluster group+kind+name, Machine group+kind+name)
+// that uniquely identify a machine-plan Secret, then returns the one with the
+// system-agent Secret type.
 // Returns (nil, nil) when the system-agent has not registered yet.
 func (h *ExtensionHandlers) findMachinePlanSecret(
 	ctx context.Context,
 	machine *clusterv1.Machine,
 ) (*corev1.Secret, error) {
+	clusterName := machine.Labels[clusterv1.ClusterNameLabel]
+
 	secretList := &corev1.SecretList{}
 	if err := h.client.List(ctx, secretList,
 		client.InNamespace(machine.Namespace),
 		client.MatchingLabels{
-			planv1alpha1.ClusterLifecycleGroupLabel: "cluster.x-k8s.io",
+			planv1alpha1.ClusterLifecycleGroupLabel: clusterv1.GroupVersion.Group,
 			planv1alpha1.ClusterLifecycleKindLabel:  "Cluster",
-			planv1alpha1.ClusterLifecycleNameLabel:  machine.Spec.ClusterName,
+			planv1alpha1.ClusterLifecycleNameLabel:  clusterName,
+			planv1alpha1.MachineLifecycleGroupLabel: clusterv1.GroupVersion.Group,
+			planv1alpha1.MachineLifecycleKindLabel:  "Machine",
 			planv1alpha1.MachineLifecycleNameLabel:  machine.Name,
 		},
 	); err != nil {
@@ -453,7 +524,17 @@ func derivePlanStatus(secret *corev1.Secret, planJSON []byte) plan.PlanStatus {
 		case plan.PlanStateSucceeded:
 			result.Applied = true
 			result.ProbesPassed = true
-		case plan.PlanStateFailed, plan.PlanStateCancelled:
+		case plan.PlanStateFailed:
+			result.Failed = true
+		case plan.PlanStateCancelled:
+			// A cancelled plan is treated as a failure today: CAPRKE2 will
+			// fall back to a rolling replace per the proposal's "fallback to
+			// immutable rollouts" tenet. If cancellation should instead
+			// resume with a freshly-written plan (cancel-then-rewrite, per
+			// the system-agent RFD's orchestrator protocol), this branch
+			// should fall through to writing a new plan instead —
+			// deliberately left as Failed until someone decides which
+			// behavior is wanted.
 			result.Failed = true
 		case plan.PlanStateInProgress:
 			result.InProgress = true
