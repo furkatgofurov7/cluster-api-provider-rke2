@@ -40,7 +40,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/olekukonko/errors"
+	plan "github.com/rancher/rancher/pkg/plan"
+	planv1alpha1 "github.com/rancher/rancher/pkg/plan/api/plan.cattle.io/v1alpha1"
 	"gomodules.xyz/jsonpatch/v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -52,9 +54,6 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 
-	plan "github.com/rancher/rancher/pkg/plan"
-	planv1alpha1 "github.com/rancher/rancher/pkg/plan/api/plan.cattle.io/v1alpha1"
-
 	bootstrapv1 "github.com/rancher/cluster-api-provider-rke2/bootstrap/api/v1beta2"
 	controlplanev1 "github.com/rancher/cluster-api-provider-rke2/controlplane/api/v1beta2"
 )
@@ -62,7 +61,7 @@ import (
 const (
 	// secretTypeMachinePlan is the Secret.Type that Rancher's system-agent
 	// sets on the machine-plan Secret it registers on first contact.
-	secretTypeMachinePlan = "rke.cattle.io/machine-plan"
+	secretTypeMachinePlan = "rke.cattle.io/machine-plan" //nolint:gosec // false positive: this is a constant, not a credential
 
 	// inplaceUpdateStartedAnnotation records when this extension first
 	// observed the current in-place update attempt for a Machine. Used to
@@ -75,6 +74,11 @@ const (
 	// rolling replace instead of polling forever.
 	inplaceUpdateTimeout = 30 * time.Minute
 )
+
+// ErrMachinePlanSecretNotFound indicates system-agent has not yet
+// registered the machine-plan Secret for this Machine. Callers should
+// treat this as a transient, retryable state rather than a hard failure.
+var ErrMachinePlanSecretNotFound = errors.New("machine-plan secret not found")
 
 // ExtensionHandlers holds the shared client used by all in-place update hook handlers.
 type ExtensionHandlers struct {
@@ -151,6 +155,7 @@ func (h *ExtensionHandlers) DoCanUpdateMachine(
 	// BootstrapConfig (RKE2Config)
 	currentRKE2Config, isCurrentRKE2Config := currentBootstrapConfig.(*bootstrapv1.RKE2Config)
 	desiredRKE2Config, isDesiredRKE2Config := desiredBootstrapConfig.(*bootstrapv1.RKE2Config)
+
 	if isCurrentRKE2Config && isDesiredRKE2Config {
 		canUpdateRKE2ConfigSpec(&currentRKE2Config.Spec, &desiredRKE2Config.Spec)
 	}
@@ -192,6 +197,7 @@ func (h *ExtensionHandlers) DoCanUpdateMachineSet(
 	// BootstrapConfig (RKE2ConfigTemplate)
 	currentRKE2ConfigTemplate, isCurrentRKE2ConfigTemplate := currentBootstrapConfigTemplate.(*bootstrapv1.RKE2ConfigTemplate)
 	desiredRKE2ConfigTemplate, isDesiredRKE2ConfigTemplate := desiredBootstrapConfigTemplate.(*bootstrapv1.RKE2ConfigTemplate)
+
 	if isCurrentRKE2ConfigTemplate && isDesiredRKE2ConfigTemplate {
 		canUpdateRKE2ConfigSpec(&currentRKE2ConfigTemplate.Spec.Template.Spec, &desiredRKE2ConfigTemplate.Spec.Template.Spec)
 	}
@@ -257,8 +263,10 @@ func (h *ExtensionHandlers) DoUpdateMachine(
 
 		return
 	}
+
 	if timedOut {
 		log.Info("in-place update timed out; reporting failure so CAPRKE2 can fall back to a rolling replace")
+
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = fmt.Sprintf("in-place update did not complete within %s", inplaceUpdateTimeout)
 
@@ -272,16 +280,17 @@ func (h *ExtensionHandlers) DoUpdateMachine(
 	// Find the machine-plan Secret registered by system-agent on first contact.
 	secret, err := h.findMachinePlanSecret(ctx, machine)
 	if err != nil {
+		if errors.Is(err, ErrMachinePlanSecretNotFound) {
+			log.V(1).Info("machine-plan Secret not yet registered by system-agent; retrying")
+
+			resp.Status = runtimehooksv1.ResponseStatusSuccess
+			resp.RetryAfterSeconds = 30
+
+			return
+		}
+
 		resp.Status = runtimehooksv1.ResponseStatusFailure
 		resp.Message = fmt.Sprintf("failed to find machine-plan Secret: %v", err)
-
-		return
-	}
-
-	if secret == nil {
-		log.V(1).Info("machine-plan Secret not yet registered by system-agent; retrying")
-		resp.Status = runtimehooksv1.ResponseStatusSuccess
-		resp.RetryAfterSeconds = 30
 
 		return
 	}
@@ -318,6 +327,7 @@ func (h *ExtensionHandlers) DoUpdateMachine(
 	switch {
 	case ps.Success():
 		log.Info("Machine upgrade complete")
+
 		resp.Status = runtimehooksv1.ResponseStatusSuccess
 		resp.RetryAfterSeconds = 0
 
@@ -333,6 +343,7 @@ func (h *ExtensionHandlers) DoUpdateMachine(
 		}
 	default:
 		log.V(1).Info("Machine upgrade in progress", "planStatus", ps.String())
+
 		resp.Status = runtimehooksv1.ResponseStatusSuccess
 		resp.RetryAfterSeconds = 30
 	}
@@ -348,6 +359,7 @@ func (h *ExtensionHandlers) checkTimeout(ctx context.Context, machine *clusterv1
 		if machine.Annotations == nil {
 			machine.Annotations = map[string]string{}
 		}
+
 		machine.Annotations[inplaceUpdateStartedAnnotation] = time.Now().UTC().Format(time.RFC3339)
 
 		return false, h.client.Patch(ctx, machine, patch)
@@ -355,7 +367,10 @@ func (h *ExtensionHandlers) checkTimeout(ctx context.Context, machine *clusterv1
 
 	started, err := time.Parse(time.RFC3339, startedAt)
 	if err != nil {
-		// Malformed annotation shouldn't block retries; treat as just-started.
+		// Malformed annotation shouldn't block retries; log it and treat as just-started.
+		log := ctrl.LoggerFrom(ctx)
+		log.Error(err, "Malformed inplace update started annotation, treating as just-started", "startedAt", startedAt)
+
 		return false, nil
 	}
 
@@ -420,12 +435,14 @@ func (h *ExtensionHandlers) findMachinePlanSecret(
 	); err != nil {
 		return nil, err
 	}
+
 	for i := range secretList.Items {
 		if secretList.Items[i].Type == secretTypeMachinePlan {
 			return &secretList.Items[i], nil
 		}
 	}
-	return nil, nil
+
+	return nil, ErrMachinePlanSecretNotFound
 }
 
 // writePlanToSecret patches the machine-plan Secret with the new plan JSON and
@@ -436,13 +453,16 @@ func (h *ExtensionHandlers) writePlanToSecret(
 	planJSON []byte,
 ) error {
 	updated := secret.DeepCopy()
+
 	if updated.Data == nil {
 		updated.Data = map[string][]byte{}
 	}
+
 	updated.Data["plan"] = planJSON
 	// Clear old applied-plan markers so system-agent picks up the new plan.
 	delete(updated.Data, "appliedPlan")
 	delete(updated.Data, plan.PlanStateKey)
+
 	return h.client.Update(ctx, updated)
 }
 
@@ -498,6 +518,7 @@ func rke2ServiceUnit(machine *clusterv1.Machine) string {
 	if _, isCP := machine.Labels[clusterv1.MachineControlPlaneLabel]; isCP {
 		return "rke2-server"
 	}
+
 	return "rke2-agent"
 }
 
@@ -541,6 +562,7 @@ func derivePlanStatus(secret *corev1.Secret, planJSON []byte) plan.PlanStatus {
 		default: // PlanStatePending or unknown
 			result.Pending = true
 		}
+
 		return result
 	}
 
@@ -549,6 +571,7 @@ func derivePlanStatus(secret *corev1.Secret, planJSON []byte) plan.PlanStatus {
 		if bytes.Equal(planJSON, appliedPlan) {
 			result.Applied = true
 			result.ProbesPassed = true
+
 			return result
 		}
 	}
@@ -561,10 +584,13 @@ func derivePlanStatus(secret *corev1.Secret, planJSON []byte) plan.PlanStatus {
 				if len(rawThreshold) > 0 {
 					if ft, err := strconv.Atoi(string(rawThreshold)); err == nil && (ft == -1 || fc < ft) {
 						result.Failing = true
+
 						return result
 					}
 				}
+
 				result.Failed = true
+
 				return result
 			}
 		}
@@ -572,6 +598,7 @@ func derivePlanStatus(secret *corev1.Secret, planJSON []byte) plan.PlanStatus {
 
 	// Plan is written but the agent hasn't applied it yet.
 	result.InProgress = true
+
 	return result
 }
 
